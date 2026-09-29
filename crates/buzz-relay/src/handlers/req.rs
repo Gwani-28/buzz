@@ -327,7 +327,7 @@ pub async fn handle_req(
             )
             .await;
         };
-        if !unless_cancelled(&conn, search).await {
+        if unless_cancelled(&conn, search).await.is_none() {
             drop(_search_permit);
         }
         // One-shot: drop the claim unless a newer REQ already took the ID.
@@ -370,9 +370,11 @@ pub async fn handle_req(
 
     debug!(conn_id = %conn_id, sub_id = %sub_id, "Subscription registered");
 
-    // Registration above is one uncancellable unit; everything below is read-only
-    // delivery and races gate cancellation, so expiry drops it and releases the
-    // permit without sending another EVENT or EOSE.
+    // Registration above is one uncancellable unit; the history read below is
+    // read-only delivery and races gate cancellation, so expiry drops it and
+    // releases the permit without sending another EVENT or EOSE. It returns
+    // whether a statement timeout ended it: retirement then runs after the
+    // race, because a dropped retirement would leak its unreleased topics.
     let history = async {
         #[cfg(test)]
         crate::nip_fi_test_hooks::before_req_history(conn.tenant.community()).await;
@@ -451,11 +453,10 @@ pub async fn handle_req(
                 Err(e) => {
                     warn!(conn_id = %conn_id, sub_id = %sub_id, "Historical query failed: {e}");
                     if e.is_statement_cancelled() {
-                        close_timed_out_subscription(&sub_id, owner, &conn, &state).await;
-                    } else {
-                        conn.send(RelayMessage::eose(&sub_id));
+                        return true;
                     }
-                    return;
+                    conn.send(RelayMessage::eose(&sub_id));
+                    return false;
                 }
             };
 
@@ -532,7 +533,7 @@ pub async fn handle_req(
 
                 let msg = RelayMessage::event(&sub_id, &stored.event);
                 if !conn.send(msg) {
-                    return;
+                    return false;
                 }
                 total_sent += 1;
                 if total_sent.is_multiple_of(100) {
@@ -549,25 +550,31 @@ pub async fn handle_req(
             count = total_sent,
             "EOSE sent after historical delivery"
         );
+        false
     };
-    if !unless_cancelled(&conn, history).await {
-        drop(_req_permit);
-        super::close::close_if_owner(&sub_id, owner, None, &conn, &state).await;
+    let outcome = unless_cancelled(&conn, history).await;
+    drop(_req_permit);
+    match outcome {
+        Some(false) => {}
+        Some(true) => close_timed_out_subscription(&sub_id, owner, &conn, &state).await,
+        None => {
+            super::close::close_if_owner(&sub_id, owner, None, &conn, &state).await;
+        }
     }
 }
 
 /// Run read-only work held under an effect permit, racing it against the
 /// session gate's cancellation (NIP-FI expiry or external close). Returns
-/// `false` when cancellation won: the work is dropped at its pending await, so
+/// `None` when cancellation won: the work is dropped at its pending await, so
 /// it sends nothing further, and the caller releases the permit.
-async fn unless_cancelled(
+async fn unless_cancelled<T>(
     conn: &ConnectionState,
-    work: impl std::future::Future<Output = ()>,
-) -> bool {
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
     tokio::select! {
         biased;
-        () = conn.nip_fi_gate.cancelled() => false,
-        () = work => true,
+        () = conn.nip_fi_gate.cancelled() => None,
+        out = work => Some(out),
     }
 }
 
@@ -3655,12 +3662,157 @@ mod tests {
         expiry_during_stalled_read_releases_permit(0x0000_0001_7224_0002, true).await;
     }
 
+    // ── History statement timeout racing expiry ───────────────────────────────
+    //
+    // Drives the production history read into a real statement timeout (a lock
+    // on `events` outlasts the session `statement_timeout`), pauses retirement
+    // after the map/registry removal but before the topic release (as a
+    // contended `desired_topics` lock would), then expires the gate. Retirement
+    // must still finish: every retained topic returns to zero.
+    //
+    // Mutation evidence: move `close_timed_out_subscription` back inside the
+    // `history` future raced by `unless_cancelled` → expiry drops the paused
+    // retirement → both channel topics stay retained at 1 → test panics.
+    async fn history_timeout_retirement_survives_expiry_body() {
+        use super::super::close::test_seam::{Pause, RELEASE_PAUSE};
+        use nostr::{Filter, Keys};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+        use tokio_util::sync::CancellationToken;
+        use uuid::Uuid;
+
+        let url = crate::test_support::database_url();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .after_connect(|c, _| {
+                Box::pin(async move {
+                    sqlx::query("SET statement_timeout = '200ms'")
+                        .execute(c)
+                        .await
+                        .map(|_| ())
+                })
+            })
+            .connect(&url)
+            .await
+            .expect("connect to test DB");
+        let state = crate::state::tests::test_state_with_database_pool(pool).await;
+        let blocker = sqlx::PgPool::connect(&url).await.expect("connect blocker");
+        let mut lock = blocker.begin().await.expect("begin blocker");
+        sqlx::query("LOCK TABLE events IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *lock)
+            .await
+            .expect("lock events");
+
+        let keys = Keys::generate();
+        let deadline = chrono::Utc::now() + chrono::Duration::hours(1);
+        let cancel = CancellationToken::new();
+        let gate = crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel.clone());
+        let community = buzz_core::tenant::CommunityId::from_uuid(Uuid::new_v4());
+        let (send_tx, _send_rx) = mpsc::channel::<axum::extract::ws::Message>(8);
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel::<axum::extract::ws::Message>(8);
+        let (terminal_ctrl_tx, _terminal_ctrl_rx) = mpsc::channel::<axum::extract::ws::Message>(1);
+        let subscriptions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let conn = Arc::new(crate::connection::ConnectionState {
+            conn_id: Uuid::new_v4(),
+            tenant: buzz_core::tenant::TenantContext::resolved(community, "test.local".to_string()),
+            remote_addr: "127.0.0.1:1234".parse().unwrap(),
+            auth_state: std::sync::Mutex::new(crate::connection::AuthState::Authenticated(
+                buzz_auth::AuthContext {
+                    pubkey: keys.public_key(),
+                    scopes: vec![],
+                    channel_ids: None,
+                    auth_method: buzz_auth::AuthMethod::Nip42,
+                    agent_owner_pubkey: None,
+                },
+            )),
+            subscriptions: Arc::clone(&subscriptions),
+            send_tx,
+            ctrl_tx,
+            terminal_ctrl_tx,
+            cancel: cancel.clone(),
+            backpressure_count: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            grace_limit: 3,
+            nip_fi_assertion: None,
+            session_deadline: Some(deadline),
+            nip_fi_gate: Arc::clone(&gate),
+        });
+        let channels = [Uuid::new_v4(), Uuid::new_v4()];
+        state.accessible_channels_cache.insert(
+            (community, keys.public_key().to_bytes().to_vec()),
+            channels.to_vec(),
+        );
+        let filters: Vec<Filter> = channels
+            .iter()
+            .map(|ch| {
+                Filter::new()
+                    .kind(nostr::Kind::TextNote)
+                    .custom_tag(
+                        nostr::SingleLetterTag::lowercase(nostr::Alphabet::H),
+                        ch.to_string(),
+                    )
+                    .limit(1)
+            })
+            .collect();
+        let topics = channels.map(buzz_pubsub::EventTopic::Channel);
+
+        let pause = Arc::new(Pause::default());
+        let handle = tokio::spawn(RELEASE_PAUSE.scope(
+            Arc::clone(&pause),
+            handle_req(
+                "timed-out".to_string(),
+                filters,
+                vec![],
+                Arc::clone(&conn),
+                Arc::clone(&state),
+            ),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), pause.reached.notified())
+            .await
+            .expect("history timeout must reach retirement");
+        // Retirement holds the lifecycle lock here, so only the index is read.
+        assert!(!registered(&state, &conn, "timed-out"));
+        for topic in topics {
+            assert_eq!(
+                state.pubsub.topic_refcount(&conn.tenant, topic).await,
+                1,
+                "topic release must still be pending at the pause"
+            );
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), gate.expire(|| {}))
+            .await
+            .expect("expiry must quiesce while retirement is paused");
+        pause.resume.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handle_req must return once retirement resumes")
+            .expect("handle_req task must not panic");
+        lock.rollback().await.expect("release events lock");
+
+        assert!(subscriptions.lock().await.is_empty());
+        assert!(!registered(&state, &conn, "timed-out"));
+        for topic in topics {
+            assert_eq!(
+                state.pubsub.topic_refcount(&conn.tenant, topic).await,
+                0,
+                "retirement must release every retained topic despite expiry"
+            );
+        }
+    }
+
     mod postgres_tests {
         #[tokio::test]
         #[ignore = "requires Postgres"]
         async fn w3_b2_req_barrier_expiry_mid_flight_blocks_subscription_registration() {
             super::w3_b2_req_barrier_expiry_mid_flight_blocks_subscription_registration_body()
                 .await;
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn history_timeout_retirement_survives_expiry() {
+            super::history_timeout_retirement_survives_expiry_body().await;
         }
     }
 }
