@@ -18,6 +18,10 @@ jobs:
       TEAM_REF: team-v0.5.28-team.10
       VERSION: 0.5.28-team.10
     steps:
+      - name: Keep LF line endings
+        shell: bash
+        run: git config --global core.autocrlf false && git config --global core.eol lf
+
       - uses: actions/checkout@v4
         with:
           repository: block/buzz
