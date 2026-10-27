@@ -1,0 +1,92 @@
+name: Team Windows build (one-off)
+
+on:
+  push:
+    branches: [team-windows]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      TARGET: x86_64-pc-windows-msvc
+      UPSTREAM_TAG: desktop-v0.5.28
+      TEAM_REF: team-v0.5.28-team.10
+      VERSION: 0.5.28-team.10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: block/buzz
+          ref: ${{ env.UPSTREAM_TAG }}
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        with:
+          repository: EugeneBot01/buzz
+          ref: ${{ env.TEAM_REF }}
+          path: team
+          sparse-checkout: team-patches
+          persist-credentials: false
+
+      - name: Apply team patches
+        shell: bash
+        run: |
+          git config user.email ci@example.invalid; git config user.name ci
+          for p in team/team-patches/*.patch; do
+            echo "== $p"
+            git apply --3way "$p"
+          done
+          rm -rf team
+
+      - name: Add Rust target
+        shell: bash
+        run: rustup target add "$TARGET"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.1
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.4.0
+
+      - name: Install desktop dependencies
+        shell: bash
+        run: pnpm install --frozen-lockfile
+
+      - name: Set version
+        shell: bash
+        run: |
+          cd desktop && node scripts/set-version-from-tag.mjs "$VERSION"
+          cd src-tauri && cargo update --workspace
+
+      - name: Non-updating bundle config
+        shell: bash
+        run: |
+          cat > desktop/src-tauri/tauri.team-win.conf.json <<'JSON'
+          { "bundle": { "createUpdaterArtifacts": false } }
+          JSON
+
+      - name: Build sidecars
+        shell: bash
+        run: |
+          cargo build --release --target "$TARGET" -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
+          ./scripts/bundle-sidecars.sh "$TARGET"
+
+      - name: Build NSIS installer (unsigned)
+        shell: bash
+        run: cd desktop && pnpm tauri build --target "$TARGET" --bundles nsis --config src-tauri/tauri.team-win.conf.json
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: buzz-team-windows-${{ env.VERSION }}
+          path: desktop/src-tauri/target/${{ env.TARGET }}/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 30
