@@ -15,8 +15,8 @@ jobs:
     env:
       TARGET: x86_64-pc-windows-msvc
       UPSTREAM_TAG: desktop-v0.5.28
-      TEAM_REF: team-v0.5.28-team.10
-      VERSION: 0.5.28-team.10
+      TEAM_REF: feat/team11
+      VERSION: 0.5.28-team.11
     steps:
       - name: Keep LF line endings
         shell: bash
@@ -40,7 +40,8 @@ jobs:
         shell: bash
         run: |
           git config user.email ci@example.invalid; git config user.name ci
-          for p in team/team-patches/*.patch; do
+          # By patch number (10, 20, ..., 99, 100), not by name: 100 sorts before 20 by name.
+          for p in $(ls team/team-patches/*.patch | sort -t/ -k3 -V); do
             echo "== $p"
             git apply --3way "$p"
           done
