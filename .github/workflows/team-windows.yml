@@ -15,8 +15,8 @@ jobs:
     env:
       TARGET: x86_64-pc-windows-msvc
       UPSTREAM_TAG: desktop-v0.5.28
-      TEAM_REF: feat/team12
-      VERSION: 0.5.28-team.12
+      TEAM_REF: feat/team14
+      VERSION: 0.5.28-team.14
     steps:
       - name: Keep LF line endings
         shell: bash
